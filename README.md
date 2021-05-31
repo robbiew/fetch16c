@@ -6,11 +6,9 @@ Utilizes the 16colo.rs api to download art packs, un-archives only files with .a
 path
    |---year
        |--- packName
-       |--- packName
-   |---year
-       |--- packName
-       |--- packName
-
+            |--- file.ans
+            |--- file.asc
+            |--- file.diz
 ```
 
 REQUIRED FOR UN-ARCHIVING!
