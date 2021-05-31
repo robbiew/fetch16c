@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -23,7 +24,7 @@ var (
 	path       string
 	currYear   int
 	fetchYears []int
-	downLinks  []string
+	only       int
 )
 
 type WriteCounter struct {
@@ -72,19 +73,20 @@ func isDir(pathFile string) bool {
 }
 
 // isEmpty returns true if the given path is empty.
-func isEmpty(name string) (bool, error) {
-	f, err := os.Open(name)
-	if err != nil {
-		return false, err
-	}
-	defer f.Close()
+// func isEmpty(name string) (bool, error) {
+// 	f, err := os.Open(name)
+// 	if err != nil {
+// 		return false, err
+// 	}
+// 	defer f.Close()
 
-	_, err = f.Readdirnames(1) // Or f.Readdir(1)
-	if err == io.EOF {
-		return true, nil
-	}
-	return false, err // Either not empty or error, suits both cases
-}
+// 	_, err = f.Readdirnames(1) // Or f.Readdir(1)
+// 	if err == io.EOF {
+// 		return true, nil
+// 	}
+// 	return false, err // Either not empty or error, suits both cases
+// }
+
 func callAPI() {
 
 	fmt.Println("Starting the application...")
@@ -117,30 +119,96 @@ func callAPI() {
 				check(err)
 			}
 
+			// get file extension/compression type (zip/lhz/rar)
+			filename := p.Download[0]
+			var ext = filepath.Ext(filename)
+
 			// download each Pack zip file in Year dir
 			fmt.Println(p.Download[0] + "... Downloading... ")
 			fileUrl := p.Download[0]
-			zipLoc := yearDir + "/" + p.Name[0] + ".zip"
+			zipLoc := yearDir + "/" + p.Name[0] + ext
+			fmt.Println("ext: ", ext)
+
 			err = DownloadFile(zipLoc, fileUrl)
 			if err != nil {
 				panic(err)
 			}
+
 			fmt.Println("Downloaded: " + fileUrl)
 
-			// upzip YEAR.ZIP to Year dir
-			packDir := yearDir + "/" + p.Name[0]
-			files, err := Unzip(zipLoc, packDir)
+			// Set file permissions
+
+			stats, err := os.Stat(zipLoc)
 			if err != nil {
 				log.Fatal(err)
 			}
-			fmt.Println("Unzipped:\n" + strings.Join(files, "\n"))
-			// Remove zip file from the directory
-			e := os.Remove(packDir + ".zip")
-			if e != nil {
-				log.Fatal(e)
+			fmt.Printf("Permission File Before: %s\n", stats.Mode())
+			err = os.Chmod(zipLoc, 0777)
+			if err != nil {
+				log.Fatal(err)
 			}
 
+			stats, err = os.Stat(zipLoc)
+			if err != nil {
+				log.Fatal(err)
+			}
+			fmt.Printf("Permission File After: %s\n", stats.Mode())
+
+			if ext == ".zip" || ext == ".ZIP" {
+
+				// upzip YEAR.ZIP to Year dir
+
+				packDir := yearDir + "/" + p.Name[0]
+
+				files, err := Unzip(zipLoc, packDir)
+				if err != nil {
+					log.Fatal(err)
+				}
+				fmt.Println("Extracted:\n" + strings.Join(files, "\n"))
+
+				// Remove zip file from the directory
+				e := os.Remove(packDir + ".zip")
+				if e != nil {
+					log.Fatal(e)
+				}
+
+			}
+
+			if ext == ".lha" || ext == ".LHA" {
+
+				// move archive to its Pack directory
+
+				packDir := yearDir + "/" + p.Name[0]
+				os.Mkdir(packDir, 0755)
+				newloc := yearDir + "/" + p.Name[0] + "/" + p.Name[0] + ext
+				os.Rename(zipLoc, newloc)
+
+				// change to working directory
+
+				os.Chdir(packDir)
+				newDir, err := os.Getwd()
+				if err != nil {
+					log.Fatal(err)
+				}
+
+				// extract lha file
+
+				fmt.Printf("Extracting: %s.lzh to %s\n", p.Name[0], newDir)
+
+				prg := "lhasa"
+				arg1 := "-e"
+				arg2 := newloc
+
+				cmd := exec.Command(prg, arg1, arg2)
+				cmd.Run()
+
+				// TO DO: remove lha lhz archive
+
+			} else {
+				fmt.Println("can't decompress extension " + ext + "...")
+			}
 		}
+
 	}
 }
 
@@ -203,29 +271,6 @@ func Unzip(src string, dest string) ([]string, error) {
 }
 
 // DownloadFile will download a url to a local file. It's efficient because it will
-// write as it downloads and not load the whole file into memory.
-// func DownloadFile(filepath string, url string) error {
-
-// 	// Get the data
-// 	resp, err := http.Get(url)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	defer resp.Body.Close()
-
-// 	// Create the file
-// 	out, err := os.Create(filepath)
-// 	if err != nil {
-// 		return err
-// 	}
-// 	defer out.Close()
-
-// 	// Write the body to file
-// 	_, err = io.Copy(out, resp.Body)
-// 	return err
-// }
-
-// DownloadFile will download a url to a local file. It's efficient because it will
 // write as it downloads and not load the whole file into memory. We pass an io.TeeReader
 // into Copy() to report progress on the download.
 func DownloadFile(filepath string, url string) error {
@@ -266,10 +311,13 @@ func DownloadFile(filepath string, url string) error {
 
 func main() {
 
-	yearsPtr := flag.Int("years", 2, "number of years back to retrieve")
-	pathPtr := flag.String("path", "", "path to download files")
+	// var onlyPtr *int
 
-	required := []string{"years", "path"}
+	yearsPtr := flag.Int("years", 0, "number of years back to retrieve")
+	pathPtr := flag.String("path", "", "path to download files")
+	// onlyPtr = flag.Int("only", 1995, " year")
+
+	required := []string{"path"}
 	flag.Parse()
 
 	seen := make(map[string]bool)
@@ -279,13 +327,20 @@ func main() {
 			// or possibly use `log.Fatalf` instead of:
 			fmt.Fprintf(os.Stderr, "missing required -%s argument/flag\n", req)
 			os.Exit(2) // the same exit code flag.Parse uses
+
 		}
 	}
 
 	path = *pathPtr
 	yearsBack = *yearsPtr
+	// only = *onlyPtr
 	t := time.Now()
 	currYear = t.Year()
+
+	// if onlyPtr != nil {
+	// 	currYear = only
+	// 	yearsBack = 0
+	// }
 
 	// calculate years needs...
 

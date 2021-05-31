@@ -9,3 +9,7 @@ Example: ```./fetch16c -years 4 -path /home/robbiew/art``` would grab 4 years of
 
 If you just want the current year's pack, use `-years 0`
 
+Optionally, if you just want a specific year'd packs:
+
+```/fetch16c -only 1995 -path /home/pi/art```
+
