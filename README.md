@@ -1,5 +1,5 @@
 # fetch16c
-Utilizes the 16colo.rs api to download art packs, un-archives them and places into folders:
+Utilizes the 16colo.rs api to download art packs, un-archives only files with .ans, asc or .diz extensions and places them into pack folders, organized by year:
 
 
 ```
@@ -12,8 +12,11 @@ path
        |--- packName
 
 ```
-          
-Support .zip archives internally, .lzh requires lhasa to be installed.
+
+REQUIRED FOR UN-ARCHIVING!
+(install via apt, homebrew, etc.)
+.zip files require unzip to be installed. 
+.lzh files require lhasa to be installed.
 
 usage:
 
