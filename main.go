@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -25,6 +26,7 @@ var (
 	currYear   int
 	fetchYears []int
 	only       int
+	platform   string
 )
 
 type WriteCounter struct {
@@ -160,11 +162,27 @@ func callAPI() {
 
 				packDir := yearDir + "/" + p.Name[0]
 
-				files, err := Unzip(zipLoc, packDir)
-				if err != nil {
-					log.Fatal(err)
-				}
-				fmt.Println("Extracted:\n" + strings.Join(files, "\n"))
+				// files, err := Unzip(zipLoc, packDir)
+				// if err != nil {
+				// 	log.Fatal(err)
+				// }
+				// fmt.Println("Extracted:\n" + strings.Join(files, "\n"))
+
+				prg := "unzip"
+				arg0 := "-d"
+				arg1 := packDir
+				arg2 := zipLoc
+				arg3 := "*.ans"
+				arg4 := "*.ANS"
+				arg5 := "*.diz"
+				arg6 := "*.DIZ"
+				arg7 := "*.asc"
+				arg8 := "*.ASC"
+
+				// unzip -d images/ archive.zip "*.jpg" "*.png" "*.gif"
+
+				cmd := exec.Command(prg, arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)
+				cmd.Run()
 
 				// Remove zip file from the directory
 				e := os.Remove(packDir + ".zip")
@@ -193,9 +211,17 @@ func callAPI() {
 
 				// extract lha file
 
-				fmt.Printf("Extracting: %s.lzh to %s\n", p.Name[0], newDir)
+				fmt.Printf("Extracting: %s.lha to %s\n", p.Name[0], newDir)
 
-				prg := "lhasa"
+				var prg string
+
+				if platform == "mac" {
+					prg = "lha"
+
+				} else {
+					prg = "lhasa"
+				}
+
 				arg1 := "-e"
 				arg2 := newloc
 
@@ -204,8 +230,6 @@ func callAPI() {
 
 				// TO DO: remove lha lhz archive
 
-			} else {
-				fmt.Println("can't decompress extension " + ext + "...")
 			}
 		}
 
@@ -310,6 +334,18 @@ func DownloadFile(filepath string, url string) error {
 }
 
 func main() {
+
+	platform := runtime.GOOS
+	switch platform {
+	case "windows":
+		platform = "windows"
+	case "darwin":
+		platform = "mac"
+	case "linux":
+		platform = "linux"
+	default:
+		platform = "linux"
+	}
 
 	// var onlyPtr *int
 
