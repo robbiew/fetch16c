@@ -13,8 +13,8 @@ path
 
 REQUIRED FOR UN-ARCHIVING!
 (install via apt, homebrew, etc.)
-.zip files require unzip to be installed. 
-.lzh files require lhasa to be installed.
+- .zip files require unzip to be installed. 
+- .lzh files require lhasa to be installed.
 
 usage:
 
