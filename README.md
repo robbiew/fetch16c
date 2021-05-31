@@ -2,9 +2,16 @@
 Utilizes the 16colo.rs api to download art packs, un-archives them and places into folders:
 
 
-+-- path
-|   +-- year
-|       +-- packName
+```
+path
+   |---year
+       |--- packName
+       |--- packName
+   |---year
+       |--- packName
+       |--- packName
+
+```
           
 Support .zip archives internally, .lzh requires lhasa to be installed.
 
