@@ -36,6 +36,7 @@ type Pack struct {
 	Year     []string `njson:"results.1.year"`
 	Download []string `njson:"results.#.download"`
 	Name     []string `njson:"results.#.name"`
+	Archive  []string `njson:"results.#.archive"`
 }
 
 const url = "https://api.16colo.rs/v1/year/"
@@ -74,19 +75,19 @@ func isDir(pathFile string) bool {
 }
 
 // isEmpty returns true if the given path is empty.
-// func isEmpty(name string) (bool, error) {
-// 	f, err := os.Open(name)
-// 	if err != nil {
-// 		return false, err
-// 	}
-// 	defer f.Close()
+func isEmpty(name string) (bool, error) {
+	f, err := os.Open(name)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
 
-// 	_, err = f.Readdirnames(1) // Or f.Readdir(1)
-// 	if err == io.EOF {
-// 		return true, nil
-// 	}
-// 	return false, err // Either not empty or error, suits both cases
-// }
+	_, err = f.Readdirnames(1) // Or f.Readdir(1)
+	if err == io.EOF {
+		return true, nil
+	}
+	return false, err // Either not empty or error, suits both cases
+}
 
 func callAPI() {
 
@@ -127,7 +128,7 @@ func callAPI() {
 			// download each Pack zip file in Year dir
 			fmt.Println(p.Download[0] + "... Downloading... ")
 			fileUrl := p.Download[0]
-			zipLoc := yearDir + "/" + p.Name[0] + ext
+			zipLoc := yearDir + "/" + p.Archive[0]
 			fmt.Println("ext: ", ext)
 
 			err = DownloadFile(zipLoc, fileUrl)
@@ -138,35 +139,25 @@ func callAPI() {
 			fmt.Println("Downloaded: " + fileUrl)
 
 			// Set file permissions
+			// stats, err := os.Stat(zipLoc)
+			// if err != nil {
+			// 	log.Fatal(err)
+			// }
+			// fmt.Printf("Permission File Before: %s\n", stats.Mode())
+			// err = os.Chmod(zipLoc, 0777)
+			// if err != nil {
+			// 	log.Fatal(err)
+			// }
 
-			stats, err := os.Stat(zipLoc)
-			if err != nil {
-				log.Fatal(err)
-			}
-			fmt.Printf("Permission File Before: %s\n", stats.Mode())
-			err = os.Chmod(zipLoc, 0777)
-			if err != nil {
-				log.Fatal(err)
-			}
-
-			stats, err = os.Stat(zipLoc)
-			if err != nil {
-				log.Fatal(err)
-			}
-			fmt.Printf("Permission File After: %s\n", stats.Mode())
+			// stats, err = os.Stat(zipLoc)
+			// if err != nil {
+			// 	log.Fatal(err)
+			// }
+			// fmt.Printf("Permission File After: %s\n", stats.Mode())
 
 			if ext == ".zip" || ext == ".ZIP" {
-
-				// upzip YEAR.ZIP to Year dir
-
+				// user must have unzip installed
 				packDir := yearDir + "/" + p.Name[0]
-
-				// files, err := Unzip(zipLoc, packDir)
-				// if err != nil {
-				// 	log.Fatal(err)
-				// }
-				// fmt.Println("Extracted:\n" + strings.Join(files, "\n"))
-
 				prg := "unzip"
 				arg0 := "-d"
 				arg1 := packDir
@@ -178,30 +169,26 @@ func callAPI() {
 				arg7 := "*.asc"
 				arg8 := "*.ASC"
 
-				// unzip -d images/ archive.zip "*.jpg" "*.png" "*.gif"
+				// unzip -d pack/ archive.zip "*.ans" "*.asc" "*.diz"
 
 				cmd := exec.Command(prg, arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)
 				cmd.Run()
 
 				// Remove zip file from the directory
-				e := os.Remove(packDir + ".zip")
+				e := os.Remove(yearDir + "/" + p.Archive[0])
 				if e != nil {
 					log.Fatal(e)
 				}
-
 			}
 
 			if ext == ".lha" || ext == ".LHA" {
-
-				// move archive to its Pack directory
-
+				// user must have lhasa installed
 				packDir := yearDir + "/" + p.Name[0]
 				os.Mkdir(packDir, 0755)
-				newloc := yearDir + "/" + p.Name[0] + "/" + p.Name[0] + ext
+				newloc := yearDir + "/" + p.Name[0] + "/" + p.Archive[0]
 				os.Rename(zipLoc, newloc)
 
 				// change to working directory
-
 				os.Chdir(packDir)
 				newDir, err := os.Getwd()
 				if err != nil {
@@ -209,18 +196,8 @@ func callAPI() {
 				}
 
 				// extract lha file
-
 				fmt.Printf("Extracting: %s.lha to %s\n", p.Name[0], newDir)
-
-				var prg string
-
-				if platform == "mac" {
-					prg = "lha"
-
-				} else {
-					prg = "lhasa"
-				}
-
+				prg := "lha"
 				arg1 := "-e"
 				arg2 := newloc
 
