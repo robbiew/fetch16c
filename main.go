@@ -15,6 +15,8 @@ import (
 	"time"
 )
 
+var version = "2.0"
+
 type Result struct {
 	Year     int      `json:"year"`
 	Name     string   `json:"name"`
@@ -45,6 +47,9 @@ type Page struct {
 }
 
 func main() {
+	fmt.Printf("Fetch16c %s by robbiew, aka aLPHA64.\n", version)
+	fmt.Println("https://github.com/robbiew/fetch16c")
+
 	years := flag.Int("years", 1, "Number of years to process from the API")
 	path := flag.String("path", "art", "Path to download the files")
 	flag.Parse()
