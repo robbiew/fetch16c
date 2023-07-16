@@ -18,13 +18,13 @@ Utilizes "Terminal progress bar for Go" for printing download progress in consol
 - ```go get github.com/cheggaaa/pb/v3```
 - ```go build .```
 
-## REQUIRED FOR UN-ARCHIVING!
+## USAGE:
+
+REQUIRED FOR UN-ARCHIVING!
 
 (install via apt, homebrew, etc.)
 - .zip files require unzip to be installed. 
 - .lzh files require lhasa to be installed.
-
-## USAGE:
 
 ```./fetch16c -years [number] -path [path/to/download]```
 
