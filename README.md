@@ -1,5 +1,5 @@
 # fetch16c
-Utilizes the 16colo.rs api to download art packs, un-archives only files with .ans, asc or .diz extensions and places them into pack folders, organized by year:
+Utilizes the 16colo.rs api to download art packs, un-archives only files with .ans, asc or .diz extensions and places them into pack folders, organized by year and 16Colo.rs spack name:
 
 
 ```
@@ -22,8 +22,8 @@ usage:
 
 Example: ```./fetch16c -years 4 -path /home/robbiew/art``` would grab 4 years of packs from the current year.
 
-If you just want the current year's pack, use `-years 0`
+If you just want the current year's pack, use `-years 1`
 
-For Linux, Rpi and Mac...
+Tested on Ubuntu 22.04.
 
 

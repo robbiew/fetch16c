@@ -1,315 +1,254 @@
 package main
 
 import (
+	"archive/zip"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"github.com/cheggaaa/pb/v3"
 	"io"
-	"io/ioutil"
-	"log"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
-	"strconv"
 	"strings"
 	"time"
-
-	"github.com/dustin/go-humanize"
-	"github.com/m7shapan/njson"
 )
 
-var (
-	yearsBack  int
-	path       string
-	currYear   int
-	fetchYears []int
-	only       int
-	platform   string
-)
-
-type WriteCounter struct {
-	Total uint64
+type Result struct {
+	Year     int      `json:"year"`
+	Name     string   `json:"name"`
+	Download string   `json:"download"`
+	Gallery  string   `json:"gallery"`
+	Archive  string   `json:"archive"`
+	Groups   []string `json:"groups"`
 }
 
-type Pack struct {
-	Year     []string `njson:"results.1.year"`
-	Download []string `njson:"results.#.download"`
-	Name     []string `njson:"results.#.name"`
-	Archive  []string `njson:"results.#.archive"`
+type Response struct {
+	Page    Page     `json:"page"`
+	Results []Result `json:"results"`
 }
 
-const url = "https://api.16colo.rs/v1/year/"
-
-func check(e error) {
-	if e != nil {
-		panic(e)
-	}
-}
-
-func (wc *WriteCounter) Write(p []byte) (int, error) {
-	n := len(p)
-	wc.Total += uint64(n)
-	wc.PrintProgress()
-	return n, nil
-}
-
-func (wc WriteCounter) PrintProgress() {
-	// Clear the line by using a character return to go back to the start and remove
-	// the remaining characters by filling it with spaces
-	fmt.Printf("\r%s", strings.Repeat(" ", 35))
-
-	// Return again and print current status of download
-	// We use the humanize package to print the bytes in a meaningful way (e.g. 10 MB)
-	fmt.Printf("\rDownloading... %s complete", humanize.Bytes(wc.Total))
-}
-
-// isDir returns true if the given path is an existing directory.
-func isDir(pathFile string) bool {
-	if pathAbs, err := filepath.Abs(pathFile); err != nil {
-		return false
-	} else if fileInfo, err := os.Stat(pathAbs); os.IsNotExist(err) || !fileInfo.IsDir() {
-		return false
-	}
-	return true
-}
-
-// isEmpty returns true if the given path is empty.
-func isEmpty(name string) (bool, error) {
-	f, err := os.Open(name)
-	if err != nil {
-		return false, err
-	}
-	defer f.Close()
-
-	_, err = f.Readdirnames(1) // Or f.Readdir(1)
-	if err == io.EOF {
-		return true, nil
-	}
-	return false, err // Either not empty or error, suits both cases
-}
-
-func callAPI() {
-
-	fmt.Println("Starting the application...")
-
-	for _, year := range fetchYears {
-		response, err := http.Get(url + strconv.Itoa(year))
-		json, _ := ioutil.ReadAll(response.Body)
-		if err != nil {
-			fmt.Printf("The HTTP request failed with error %s\n", err)
-		} else {
-			p := Pack{}
-			err := njson.Unmarshal([]byte(json), &p)
-			if err != nil {
-				// do anything
-			}
-
-			// fmt.Printf("%+v\n", p.Year[0])
-
-			// Make sure YEAR directort doesn't exist (exit if it does)
-			yearDir := path + "/" + p.Year[0]
-
-			if isDir(yearDir) {
-				fmt.Println("ABORT! Directory exists: " + yearDir + ". Please remove dir and try again.")
-				os.Exit(0)
-			} else {
-				fmt.Println(yearDir + "... Creating directory... ")
-				err = os.Chdir(path)
-				check(err)
-				err := os.Mkdir(p.Year[0], 0755)
-				check(err)
-			}
-
-			// get file extension/compression type (zip/lhz/rar)
-			filename := p.Download[0]
-			var ext = filepath.Ext(filename)
-
-			// download each Pack zip file in Year dir
-			fmt.Println(p.Download[0] + "... Downloading... ")
-			fileUrl := p.Download[0]
-			zipLoc := yearDir + "/" + p.Archive[0]
-			fmt.Println("ext: ", ext)
-
-			err = DownloadFile(zipLoc, fileUrl)
-			if err != nil {
-				panic(err)
-			}
-
-			fmt.Println("Downloaded: " + fileUrl)
-
-			// Set file permissions
-			// stats, err := os.Stat(zipLoc)
-			// if err != nil {
-			// 	log.Fatal(err)
-			// }
-			// fmt.Printf("Permission File Before: %s\n", stats.Mode())
-			// err = os.Chmod(zipLoc, 0777)
-			// if err != nil {
-			// 	log.Fatal(err)
-			// }
-
-			// stats, err = os.Stat(zipLoc)
-			// if err != nil {
-			// 	log.Fatal(err)
-			// }
-			// fmt.Printf("Permission File After: %s\n", stats.Mode())
-
-			if ext == ".zip" || ext == ".ZIP" {
-				// user must have unzip installed
-				packDir := yearDir + "/" + p.Name[0]
-				prg := "unzip"
-				arg0 := "-d"
-				arg1 := packDir
-				arg2 := zipLoc
-				arg3 := "*.ans"
-				arg4 := "*.ANS"
-				arg5 := "*.diz"
-				arg6 := "*.DIZ"
-				arg7 := "*.asc"
-				arg8 := "*.ASC"
-
-				// unzip -d pack/ archive.zip "*.ans" "*.asc" "*.diz"
-
-				cmd := exec.Command(prg, arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)
-				cmd.Run()
-
-				// Remove zip file from the directory
-				e := os.Remove(yearDir + "/" + p.Archive[0])
-				if e != nil {
-					log.Fatal(e)
-				}
-			}
-
-			if ext == ".lha" || ext == ".LHA" {
-				// user must have lhasa installed
-				packDir := yearDir + "/" + p.Name[0]
-				os.Mkdir(packDir, 0755)
-				newloc := yearDir + "/" + p.Name[0] + "/" + p.Archive[0]
-				os.Rename(zipLoc, newloc)
-
-				// change to working directory
-				os.Chdir(packDir)
-				newDir, err := os.Getwd()
-				if err != nil {
-					log.Fatal(err)
-				}
-
-				// extract lha file
-				fmt.Printf("Extracting: %s.lha to %s\n", p.Name[0], newDir)
-				prg := "lha"
-				arg1 := "-e"
-				arg2 := newloc
-
-				cmd := exec.Command(prg, arg1, arg2)
-				cmd.Run()
-
-				// TO DO: remove lha lhz archive
-			}
-		}
-	}
-}
-
-// DownloadFile will download a url to a local file. It's efficient because it will
-// write as it downloads and not load the whole file into memory. We pass an io.TeeReader
-// into Copy() to report progress on the download.
-func DownloadFile(filepath string, url string) error {
-
-	// Create the file, but give it a tmp file extension, this means we won't overwrite a
-	// file until it's downloaded, but we'll remove the tmp extension once downloaded.
-	out, err := os.Create(filepath + ".tmp")
-	if err != nil {
-		return err
-	}
-
-	// Get the data
-	resp, err := http.Get(url)
-	if err != nil {
-		out.Close()
-		return err
-	}
-	defer resp.Body.Close()
-
-	// Create our progress reporter and pass it to be used alongside our writer
-	counter := &WriteCounter{}
-	if _, err = io.Copy(out, io.TeeReader(resp.Body, counter)); err != nil {
-		out.Close()
-		return err
-	}
-
-	// The progress use the same line so print a new line once it's finished downloading
-	fmt.Print("\n")
-
-	// Close the file without defer so it can happen before Rename()
-	out.Close()
-
-	if err = os.Rename(filepath+".tmp", filepath); err != nil {
-		return err
-	}
-	return nil
+type Page struct {
+	Total    int    `json:"total"`
+	Sort     string `json:"sort"`
+	Order    string `json:"order"`
+	PageSize int    `json:"pagesize"`
+	Page     int    `json:"page"`
+	Pages    int    `json:"pages"`
+	Offset   int    `json:"offset"`
+	Options  struct {
+		Filter interface{} `json:"filter"`
+		Type   string      `json:"type"`
+		Groups bool        `json:"groups"`
+	} `json:"options"`
 }
 
 func main() {
-
-	platform := runtime.GOOS
-	switch platform {
-	case "windows":
-		platform = "windows"
-	case "darwin":
-		platform = "mac"
-	case "linux":
-		platform = "linux"
-	default:
-		platform = "linux"
-	}
-
-	// var onlyPtr *int
-
-	yearsPtr := flag.Int("years", 0, "number of years back to retrieve")
-	pathPtr := flag.String("path", "", "path to download files")
-	// onlyPtr = flag.Int("only", 1995, " year")
-
-	required := []string{"path"}
+	years := flag.Int("years", 1, "Number of years to process from the API")
+	path := flag.String("path", "art", "Path to download the files")
 	flag.Parse()
 
-	seen := make(map[string]bool)
-	flag.Visit(func(f *flag.Flag) { seen[f.Name] = true })
-	for _, req := range required {
-		if !seen[req] {
-			// or possibly use `log.Fatalf` instead of:
-			fmt.Fprintf(os.Stderr, "missing required -%s argument/flag\n", req)
-			os.Exit(2) // the same exit code flag.Parse uses
+	currentYear := time.Now().Year()
+	for i := 0; i < *years; i++ {
+		year := currentYear - i
+		apiURL := fmt.Sprintf("https://api.16colo.rs/v1/year/%d", year)
+		response, err := fetchAPIResponse(apiURL)
+		if err != nil {
+			fmt.Printf("Error fetching API response for year %d: %v\n", year, err)
+			continue
+		}
 
+		// Create the output directory for the year if it doesn't exist
+		yearPath := filepath.Join(*path, fmt.Sprintf("%d", year))
+		err = os.MkdirAll(yearPath, os.ModePerm)
+		if err != nil {
+			fmt.Printf("Error creating output directory for year %d: %v\n", year, err)
+			continue
+		}
+
+		var failedFiles []string
+
+		for _, result := range response.Results {
+			archiveURL := result.Download
+			filename := filepath.Base(archiveURL)
+			outputDir := filepath.Join(yearPath, result.Name)
+
+			// Create the output directory for the pack if it doesn't exist
+			err = os.MkdirAll(outputDir, os.ModePerm)
+			if err != nil {
+				fmt.Printf("Error creating output directory for pack %s: %v\n", result.Name, err)
+				continue
+			}
+
+			archivePath := filepath.Join(yearPath, filename)
+
+			err = downloadFile(archiveURL, archivePath)
+			if err != nil {
+				fmt.Printf("Error downloading file: %v\n", err)
+				continue
+			}
+
+			err = extractArchive(archivePath, outputDir)
+			if err != nil {
+				fmt.Printf("Error extracting archive: %v\n", err)
+				failedFiles = append(failedFiles, result.Name)
+				continue
+			}
+
+			err = os.Remove(archivePath)
+			if err != nil {
+				fmt.Printf("Error deleting archive: %v\n", err)
+				continue
+			}
+
+			fmt.Printf("Extracted archive: %s\n", result.Name)
+		}
+
+		if len(failedFiles) > 0 {
+			fmt.Println("The following files had errors and were not processed:")
+			for _, file := range failedFiles {
+				fmt.Println(file)
+			}
+		}
+	}
+}
+
+func fetchAPIResponse(url string) (Response, error) {
+	var response Response
+
+	resp, err := http.Get(url)
+	if err != nil {
+		return response, fmt.Errorf("failed to fetch API response: %v", err)
+	}
+	defer resp.Body.Close()
+
+	err = json.NewDecoder(resp.Body).Decode(&response)
+	if err != nil {
+		return response, fmt.Errorf("failed to decode API response: %v", err)
+	}
+
+	return response, nil
+}
+
+func downloadFile(url string, outputPath string) error {
+	resp, err := http.Get(url)
+	if err != nil {
+		return fmt.Errorf("failed to download file: %v", err)
+	}
+	defer resp.Body.Close()
+
+	file, err := os.Create(outputPath)
+	if err != nil {
+		return fmt.Errorf("failed to create file: %v", err)
+	}
+	defer file.Close()
+
+	// Get the total size of the file
+	totalSize := resp.ContentLength
+
+	// Create the progress bar
+	bar := pb.Full.Start64(totalSize)
+	bar.Set(pb.Bytes, true)
+	bar.SetWidth(80)
+
+	// Create a custom writer that wraps the progress bar
+	writer := &ProgressBarWriter{
+		ProgressBar: bar,
+		Writer:      file,
+	}
+
+	_, err = io.Copy(writer, resp.Body)
+	if err != nil {
+		return fmt.Errorf("failed to save file: %v", err)
+	}
+
+	bar.Finish()
+
+	return nil
+}
+
+type ProgressBarWriter struct {
+	ProgressBar *pb.ProgressBar
+	Writer      io.Writer
+}
+
+func (pw *ProgressBarWriter) Write(p []byte) (int, error) {
+	n, err := pw.Writer.Write(p)
+	pw.ProgressBar.Add(n)
+	return n, err
+}
+
+func extractArchive(archivePath string, outputDir string) error {
+	extension := strings.ToLower(filepath.Ext(archivePath))
+	switch extension {
+	case ".zip":
+		return extractZipArchive(archivePath, outputDir)
+	case ".lha":
+		return extractLhaArchive(archivePath, outputDir)
+	default:
+		return fmt.Errorf("unsupported archive format: %s", extension)
+	}
+}
+
+func extractZipArchive(archivePath string, outputDir string) error {
+	r, err := zip.OpenReader(archivePath)
+	if err != nil {
+		return fmt.Errorf("failed to open ZIP archive: %v", err)
+	}
+	defer r.Close()
+
+	for _, f := range r.File {
+		err := extractFile(f, outputDir)
+		if err != nil {
+			return fmt.Errorf("failed to extract file from ZIP archive: %v", err)
 		}
 	}
 
-	path = *pathPtr
-	yearsBack = *yearsPtr
-	// only = *onlyPtr
-	t := time.Now()
-	currYear = t.Year()
+	return nil
+}
 
-	// if onlyPtr != nil {
-	// 	currYear = only
-	// 	yearsBack = 0
-	// }
-
-	// calculate years needs...
-
-	fmt.Println("Ok, going back " + strconv.Itoa(yearsBack) + " years from " + strconv.Itoa(currYear) + ":")
-
-	startYear := currYear
-	for i := (startYear) - yearsBack; i < (startYear + 1); i++ {
-		fetchYears = append(fetchYears, i)
+func extractLhaArchive(archivePath string, outputDir string) error {
+	cmd := exec.Command("lha", "x", "-w"+outputDir, archivePath)
+	err := cmd.Run()
+	if err != nil {
+		return fmt.Errorf("failed to extract LHA archive: %v", err)
 	}
 
-	// check if root dir exists
-	if isDir(path) {
-		fmt.Println("Path exists...")
-		callAPI()
+	return nil
+}
 
-	} else {
-		fmt.Println("Make sure " + path + " exists and is empty...")
+func extractFile(f *zip.File, outputDir string) error {
+	path := filepath.Join(outputDir, f.Name)
+
+	if strings.HasPrefix(f.Name, "..") || filepath.IsAbs(path) {
+		return fmt.Errorf("invalid file path: %s", f.Name)
 	}
 
+	if f.FileInfo().IsDir() {
+		os.MkdirAll(path, os.ModePerm)
+		return nil
+	}
+
+	// Create parent directories if they don't exist
+	os.MkdirAll(filepath.Dir(path), os.ModePerm)
+
+	rc, err := f.Open()
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	w, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer w.Close()
+
+	_, err = io.Copy(w, rc)
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
