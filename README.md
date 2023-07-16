@@ -28,7 +28,7 @@ REQUIRED FOR UN-ARCHIVING!
 
 ```./fetch16c -years [number] -path [path/to/download]```
 
-Example: ```./fetch16c -years 4 -path /home/robbiew/art``` would grab 4 years of packs from the current year.
+Example: ```./fetch16c -years 4 -path /home/robbiew/art``` would grab 4 years of packs from the current year and download to a local directory.
 
 If you just want the current year's pack, use `-years 1`
 
