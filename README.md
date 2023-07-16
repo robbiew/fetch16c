@@ -11,12 +11,20 @@ path
          |--- file.diz
 ```
 
-REQUIRED FOR UN-ARCHIVING!
+## BUILD:
+Utilizes "Terminal progress bar for Go" for printing download progress in console.
+
+- clone this repo
+- ```go get github.com/cheggaaa/pb/v3```
+- ```go build .```
+
+## REQUIRED FOR UN-ARCHIVING!
+
 (install via apt, homebrew, etc.)
 - .zip files require unzip to be installed. 
 - .lzh files require lhasa to be installed.
 
-usage:
+## USAGE:
 
 ```./fetch16c -years [number] -path [path/to/download]```
 
