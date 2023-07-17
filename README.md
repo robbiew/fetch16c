@@ -15,16 +15,16 @@ path
 Utilizes "Terminal progress bar for Go" for printing download progress in console.
 
 - clone this repo
-- ```go get github.com/cheggaaa/pb/v3```
+- ```go get .```
 - ```go build .```
 
 ## USAGE:
 
 REQUIRED FOR UN-ARCHIVING!
 
-(install via apt, homebrew, etc.)
-- .zip files require unzip to be installed. 
-- .lzh files require lhasa to be installed.
+(install via apt, homebrew, windows, etc. )
+- .zip files require unzip to be installed ("unzip" is called). 
+- .lzh files require lhasa to be installed ("lha" is called).
 
 ```./fetch16c -years [number] -path [path/to/download]```
 
