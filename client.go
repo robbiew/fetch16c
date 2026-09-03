@@ -69,8 +69,12 @@ func NewClientWithHTTPClient(apiBaseURL string, httpClient *http.Client, output 
 	if httpClient == nil {
 		return nil, fmt.Errorf("HTTP client cannot be nil")
 	}
+	configuredHTTPClient := *httpClient
+	configuredHTTPClient.CheckRedirect = func(request *http.Request, via []*http.Request) error {
+		return http.ErrUseLastResponse
+	}
 	return &Client{
-		httpClient: httpClient,
+		httpClient: &configuredHTTPClient,
 		apiBaseURL: parsedURL,
 		output:     output,
 		progress:   progress,
@@ -225,9 +229,6 @@ func (client *Client) Download(ctx context.Context, archiveURL *url.URL, outputP
 		return written, fmt.Errorf("incomplete download: received %d of %d bytes", written, response.ContentLength)
 	}
 
-	if err := os.Remove(outputPath); err != nil && !os.IsNotExist(err) {
-		return written, fmt.Errorf("replace archive: %w", err)
-	}
 	if err := os.Rename(temporaryPath, outputPath); err != nil {
 		return written, fmt.Errorf("commit archive: %w", err)
 	}

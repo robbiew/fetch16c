@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -85,6 +86,63 @@ func TestDownloadKeepsDestinationAndRemovesPartialFileOnInterruption(t *testing.
 	}
 	if len(partialFiles) != 0 {
 		t.Fatalf("partial files were not removed: %v", partialFiles)
+	}
+}
+
+func TestDownloadRejectsRedirectTarget(t *testing.T) {
+	var targetRequests atomic.Int32
+	target := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		targetRequests.Add(1)
+		_, _ = writer.Write([]byte("redirected archive"))
+	}))
+	defer target.Close()
+
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		http.Redirect(writer, request, target.URL+"/archive/pack.zip", http.StatusFound)
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL+"/")
+	archiveURL, err := client.ValidateArchiveURL(server.URL + "/archive/pack.zip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	outputPath := filepath.Join(t.TempDir(), "pack.zip")
+	if _, err := client.Download(context.Background(), archiveURL, outputPath, "pack"); err == nil {
+		t.Fatal("Download followed a redirect")
+	}
+	if targetRequests.Load() != 0 {
+		t.Fatalf("redirect target received %d requests", targetRequests.Load())
+	}
+	if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
+		t.Fatalf("Download created a file after a redirect: %v", err)
+	}
+}
+
+func TestDownloadPreservesDestinationWhenCommitFails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		_, _ = writer.Write([]byte("archive"))
+	}))
+	defer server.Close()
+
+	client := newTestClient(t, server.URL+"/")
+	archiveURL, err := client.ValidateArchiveURL(server.URL + "/archive/pack.zip")
+	if err != nil {
+		t.Fatal(err)
+	}
+	outputPath := filepath.Join(t.TempDir(), "pack.zip")
+	if err := os.Mkdir(outputPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Download(context.Background(), archiveURL, outputPath, "pack"); err == nil {
+		t.Fatal("Download replaced a destination directory")
+	}
+	info, err := os.Stat(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.IsDir() {
+		t.Fatal("failed download did not preserve the destination directory")
 	}
 }
 

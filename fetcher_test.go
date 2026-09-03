@@ -52,7 +52,7 @@ func TestFetcherFetchesSkipsAndOverwritesPack(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(packDir, manifestFilename)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(root, "2026", "pack.zip")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(root, "2026", "pack-pack.zip")); !os.IsNotExist(err) {
 		t.Fatal("archive was not removed after extraction")
 	}
 
@@ -90,8 +90,74 @@ func TestFetcherKeepsArchive(t *testing.T) {
 	if summary.Fetched != 1 {
 		t.Fatalf("summary = %+v", summary)
 	}
-	if _, err := os.Stat(filepath.Join(config.Path, "2026", "pack.zip")); err != nil {
+	if _, err := os.Stat(filepath.Join(config.Path, "2026", "pack-pack.zip")); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestFetcherUsesDistinctArchivePathsForSharedBasename(t *testing.T) {
+	archive := zipBytes(t, "art.ans", "ANSI art")
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/year/2026":
+			writeAPIResponse(t, writer, []Result{
+				{Year: 2026, Name: "first", Download: server.URL + "/archive/2026/pack.zip"},
+				{Year: 2026, Name: "second", Download: server.URL + "/archive/2026/pack.zip"},
+			})
+		case "/archive/2026/pack.zip":
+			_, _ = writer.Write(archive)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	config := testConfig(t.TempDir())
+	config.Concurrency = 2
+	config.KeepArchives = true
+	client := newTestClient(t, server.URL+"/")
+	summary, err := NewFetcher(client, config, io.Discard).Run(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Fetched != 2 {
+		t.Fatalf("summary = %+v", summary)
+	}
+	for _, archiveName := range []string{"first-pack.zip", "second-pack.zip"} {
+		if _, err := os.Stat(filepath.Join(config.Path, "2026", archiveName)); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestFetcherKeepsArchiveWhenPackCommitFails(t *testing.T) {
+	archive := zipBytes(t, "art.ans", "ANSI art")
+	root := t.TempDir()
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/year/2026":
+			writeAPIResponse(t, writer, []Result{{Year: 2026, Name: "pack", Download: server.URL + "/archive/2026/pack.zip"}})
+		case "/archive/2026/pack.zip":
+			if err := os.MkdirAll(filepath.Join(root, "2026", "pack"), 0o755); err != nil {
+				t.Error(err)
+			}
+			_, _ = writer.Write(archive)
+		default:
+			http.NotFound(writer, request)
+		}
+	}))
+	defer server.Close()
+
+	config := testConfig(root)
+	client := newTestClient(t, server.URL+"/")
+	summary, err := NewFetcher(client, config, io.Discard).Run(context.Background())
+	if err == nil || summary.Failed != 1 {
+		t.Fatalf("Run summary = %+v, error = %v", summary, err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "2026", "pack-pack.zip")); err != nil {
+		t.Fatal("archive was removed before the pack commit succeeded")
 	}
 }
 

@@ -301,7 +301,7 @@ func (fetcher *Fetcher) processJob(ctx context.Context, job packJob, lhaPath str
 		return packOutcome{status: "skipped"}
 	}
 
-	archivePath := filepath.Join(yearPath, filepath.Base(job.archiveURL.Path))
+	archivePath := filepath.Join(yearPath, job.result.Name+"-"+filepath.Base(job.archiveURL.Path))
 	fetcher.logf("Downloading %d/%s\n", job.year, job.result.Name)
 	downloadedBytes, err := fetcher.client.Download(ctx, job.archiveURL, archivePath, job.result.Name)
 	if err != nil {
@@ -332,13 +332,13 @@ func (fetcher *Fetcher) processJob(ctx context.Context, job packJob, lhaPath str
 		fetcher.removeArchive(archivePath)
 		return failedOutcome(job, downloadedBytes, err)
 	}
+	if err := commitDirectory(stagingDir, outputDir, fetcher.config.Overwrite); err != nil {
+		return failedOutcome(job, downloadedBytes, err)
+	}
 	if !fetcher.config.KeepArchives {
 		if err := os.Remove(archivePath); err != nil {
 			return failedOutcome(job, downloadedBytes, fmt.Errorf("remove archive: %w", err))
 		}
-	}
-	if err := commitDirectory(stagingDir, outputDir, fetcher.config.Overwrite); err != nil {
-		return failedOutcome(job, downloadedBytes, err)
 	}
 
 	fetcher.logf("Extracted %d/%s\n", job.year, job.result.Name)
