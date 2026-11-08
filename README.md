@@ -175,3 +175,7 @@ FETCH16C_LIVE_TEST=1 go test -run '^TestLive' -count=1 -v .
 ## Releasing
 
 Tag a commit with `vX.Y.Z` and push the tag. The release workflow runs the tests, then GoReleaser builds archives for Linux, macOS, and Windows on amd64 and arm64 and publishes them to GitHub Releases.
+
+## License
+
+MIT. See [LICENSE](LICENSE).

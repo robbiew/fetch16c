@@ -5,6 +5,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"hash/crc32"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -390,26 +392,251 @@ func TestZipCorpus(t *testing.T) {
 	t.Logf("%d of %d archives use legacy methods", legacy, len(archives))
 }
 
+// bitWriter packs bits least significant first, mirroring bitReader.
+type bitWriter struct {
+	data  []byte
+	bits  uint32
+	count uint
+}
+
+func (writer *bitWriter) write(value uint32, count uint) {
+	writer.bits |= value << writer.count
+	writer.count += count
+	for writer.count >= 8 {
+		writer.data = append(writer.data, byte(writer.bits))
+		writer.bits >>= 8
+		writer.count -= 8
+	}
+}
+
+// writeCode writes a Shannon-Fano code, whose first bit in the stream is its most significant.
+func (writer *bitWriter) writeCode(value uint32, length uint) {
+	for shift := length; shift > 0; shift-- {
+		writer.write(value>>(shift-1)&1, 1)
+	}
+}
+
+func (writer *bitWriter) bytes() []byte {
+	if writer.count > 0 {
+		return append(writer.data, byte(writer.bits))
+	}
+	return writer.data
+}
+
+// shrinkCompress is a minimal PKZIP Shrink encoder: LZW with explicit code-size increases.
+func shrinkCompress(data []byte) []byte {
+	writer := &bitWriter{}
+	table := make(map[string]uint32, 8192)
+	for code := range 256 {
+		table[string([]byte{byte(code)})] = uint32(code)
+	}
+	nextCode := uint32(257)
+	codeSize := uint(9)
+	current := ""
+	emit := func(code uint32) {
+		writer.write(code, codeSize)
+	}
+	for _, next := range data {
+		candidate := current + string([]byte{next})
+		if _, ok := table[candidate]; ok {
+			current = candidate
+			continue
+		}
+		emit(table[current])
+		if nextCode < 8192 {
+			if nextCode >= 1<<codeSize {
+				emit(256)
+				emit(1)
+				codeSize++
+			}
+			table[candidate] = nextCode
+			nextCode++
+		}
+		current = string([]byte{next})
+	}
+	if current != "" {
+		emit(table[current])
+	}
+	return writer.bytes()
+}
+
+func TestUnshrinkRoundTrip(t *testing.T) {
+	var plain []byte
+	for index := range 6000 {
+		plain = append(plain, []byte(fmt.Sprintf("line %d of ANSI text \x1b[1;3%dm\n", index%97, index%8))...)
+	}
+	compressed := shrinkCompress(plain)
+	if len(compressed) >= len(plain) {
+		t.Fatalf("shrink did not compress: %d >= %d", len(compressed), len(plain))
+	}
+	got, err := unshrink(bytes.NewReader(compressed), uint64(len(plain)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, plain) {
+		t.Fatal("unshrink output differs from input")
+	}
+	if _, err := unshrink(bytes.NewReader(compressed[:len(compressed)/2]), uint64(len(plain))); err == nil {
+		t.Fatal("unshrink accepted truncated data")
+	}
+}
+
+// flatTree describes a Shannon-Fano tree where every one of count symbols has the same code
+// length, which makes codes trivial: symbol s gets code count-1-s.
+func flatTree(count int, length uint) []byte {
+	tree := []byte{byte(count/16 - 1)}
+	for range count / 16 {
+		tree = append(tree, byte(15<<4|(length-1)))
+	}
+	return tree
+}
+
+// implodeCompress encodes data with literal runs and matches using flat trees. Matches are
+// given as (position, distance, length) and must not overlap the preceding literal run.
+func implodeCompress(data []byte, flags uint16, matches [][3]int) []byte {
+	var out []byte
+	literalTree := flags&implodeFlag3Trees != 0
+	minimumMatch := 2
+	if literalTree {
+		out = append(out, flatTree(256, 8)...)
+		minimumMatch = 3
+	}
+	out = append(out, flatTree(64, 6)...) // length tree
+	out = append(out, flatTree(64, 6)...) // distance tree
+	distanceBits := uint(6)
+	if flags&implodeFlag8K != 0 {
+		distanceBits = 7
+	}
+	writer := &bitWriter{}
+	position := 0
+	for _, match := range matches {
+		for ; position < match[0]; position++ {
+			writer.write(1, 1)
+			if literalTree {
+				writer.writeCode(uint32(255-int(data[position])), 8)
+			} else {
+				writer.write(uint32(data[position]), 8)
+			}
+		}
+		distance, length := match[1]-1, match[2]-minimumMatch
+		writer.write(0, 1)
+		writer.write(uint32(distance)&(1<<distanceBits-1), distanceBits)
+		writer.writeCode(uint32(63-(distance>>distanceBits)), 6)
+		if length >= 63 {
+			writer.writeCode(0, 6) // symbol 63
+			writer.write(uint32(length-63), 8)
+		} else {
+			writer.writeCode(uint32(63-length), 6)
+		}
+		position += match[2]
+	}
+	for ; position < len(data); position++ {
+		writer.write(1, 1)
+		if literalTree {
+			writer.writeCode(uint32(255-int(data[position])), 8)
+		} else {
+			writer.write(uint32(data[position]), 8)
+		}
+	}
+	return append(out, writer.bytes()...)
+}
+
+func TestExplodeDecodesAllModes(t *testing.T) {
+	prefix := []byte("\x1b[0;36mBBS ART PACK ")
+	var plain []byte
+	for range 40 {
+		plain = append(plain, prefix...)
+	}
+	plain = append(plain, bytes.Repeat([]byte{'='}, 300)...)
+	tail := []byte(" the end\n")
+	plain = append(plain, tail...)
+	// A literal prefix, three long matches that repeat it (one using the 8-bit length
+	// extension), then a literal '=' followed by an overlapping run match.
+	matches := [][3]int{
+		{len(prefix), len(prefix), 300},
+		{len(prefix) + 300, len(prefix), 300},
+		{len(prefix) + 600, len(prefix), len(prefix)*40 - len(prefix) - 600},
+		{len(prefix)*40 + 1, 1, 299},
+	}
+
+	for _, flags := range []uint16{0, implodeFlag8K, implodeFlag3Trees, implodeFlag8K | implodeFlag3Trees} {
+		compressed := implodeCompress(plain, flags, matches)
+		got, err := explode(bytes.NewReader(compressed), flags, uint64(len(plain)))
+		if err != nil {
+			t.Fatalf("flags %#x: %v", flags, err)
+		}
+		if !bytes.Equal(got, plain) {
+			t.Fatalf("flags %#x: output differs from input", flags)
+		}
+		if _, err := explode(bytes.NewReader(compressed[:len(compressed)-20]), flags, uint64(len(plain))); err == nil {
+			t.Fatalf("flags %#x: explode accepted truncated data", flags)
+		}
+	}
+}
+
 func TestExtractZipArchiveLegacyMethods(t *testing.T) {
+	unit := []byte("\x1b[1;31mANSI\x1b[0m\n")
+	plain := bytes.Repeat(unit, 50)
+	shrunk := shrinkCompress(plain)
+	// Matches are limited to 63+255 plus the minimum length, so repeat the unit in chunks.
+	var matches [][3]int
+	for position := len(unit); position < len(plain); position += 300 {
+		matches = append(matches, [3]int{position, len(unit), min(300, len(plain)-position)})
+	}
+	imploded := implodeCompress(plain, implodeFlag8K|implodeFlag3Trees, matches)
+
+	archivePath := filepath.Join(t.TempDir(), "legacy.zip")
+	file, err := os.Create(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := zip.NewWriter(file)
+	for name, member := range map[string]struct {
+		method uint16
+		flags  uint16
+		data   []byte
+	}{
+		"SHRUNK.ANS":   {zipMethodShrink, 0, shrunk},
+		"IMPLODED.ANS": {zipMethodImplode, implodeFlag8K | implodeFlag3Trees, imploded},
+	} {
+		header := &zip.FileHeader{
+			Name:               name,
+			Method:             member.method,
+			Flags:              member.flags,
+			CRC32:              crc32.ChecksumIEEE(plain),
+			CompressedSize64:   uint64(len(member.data)),
+			UncompressedSize64: uint64(len(plain)),
+		}
+		raw, err := archive.CreateRaw(header)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := raw.Write(member.data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
 	outputDir := t.TempDir()
-	damaged, err := extractZipArchive(filepath.Join("testdata", "legacy-methods.zip"), outputDir, nil)
+	damaged, err := extractZipArchive(archivePath, outputDir, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(damaged) != 0 {
 		t.Fatalf("damaged = %v", damaged)
 	}
-	sizes := map[string]int{"implode-4k-2trees.ans": 549, "implode-8k-3trees.ans": 6182, "shrink.ans": 156}
-	for name, size := range sizes {
+	for _, name := range []string{"SHRUNK.ANS", "IMPLODED.ANS"} {
 		data, err := os.ReadFile(filepath.Join(outputDir, name))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if len(data) != size {
-			t.Fatalf("%s is %d bytes, want %d", name, len(data), size)
-		}
-		if !bytes.Contains(data, []byte("\x1b[")) {
-			t.Fatalf("%s does not look like ANSI art", name)
+		if !bytes.Equal(data, plain) {
+			t.Fatalf("%s content differs", name)
 		}
 	}
 }
