@@ -6,30 +6,52 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
 )
 
-const manifestFilename = ".fetch16c.json"
+const (
+	manifestFilename = ".fetch16c.json"
+	manifestVersion  = 2
+	stagingPrefix    = ".fetch16c-staging-"
+	backupPrefix     = ".fetch16c-backup-"
+)
+
+// Pack outcome statuses.
+const (
+	statusFetched     = "fetched"
+	statusSkipped     = "skipped"
+	statusUnavailable = "unavailable"
+	statusUnsupported = "unsupported"
+	statusFailed      = "failed"
+)
 
 type Config struct {
 	Years        int
 	Year         int
 	FromYear     int
 	ToYear       int
+	AllYears     bool
+	Type         string
 	Path         string
-	Pack         string
+	Packs        []string
+	Groups       []string
+	Extensions   []string
 	SkipExisting bool
 	Overwrite    bool
 	KeepArchives bool
 	Quiet        bool
+	DryRun       bool
 	Concurrency  int
+	Retries      int
 	Timeout      time.Duration
 }
 
@@ -40,14 +62,36 @@ func (config Config) Validate(now time.Time) error {
 	if config.Year < 0 || config.FromYear < 0 || config.ToYear < 0 {
 		return errors.New("years cannot be negative")
 	}
+	if config.AllYears && (config.Year != 0 || config.FromYear != 0 || config.ToYear != 0) {
+		return errors.New("--all cannot be combined with --year, --from-year, or --to-year")
+	}
 	if config.FromYear != 0 && config.ToYear != 0 && config.FromYear > config.ToYear {
 		return errors.New("--from-year cannot be newer than --to-year")
+	}
+	if config.Type != "" && config.Type != TypePacks && config.Type != TypeMags && config.Type != TypeAll {
+		return fmt.Errorf("--type must be %s, %s, or %s", TypePacks, TypeMags, TypeAll)
 	}
 	if config.Path == "" {
 		return errors.New("--path cannot be empty")
 	}
+	for _, pattern := range config.Packs {
+		if strings.TrimSpace(pattern) == "" {
+			return errors.New("--pack cannot be empty")
+		}
+		if _, err := path.Match(pattern, ""); err != nil {
+			return fmt.Errorf("--pack pattern %q is invalid: %w", pattern, err)
+		}
+	}
+	for _, group := range config.Groups {
+		if strings.TrimSpace(group) == "" {
+			return errors.New("--group cannot be empty")
+		}
+	}
 	if config.Concurrency < 1 {
 		return errors.New("--concurrency must be at least 1")
+	}
+	if config.Retries < 0 {
+		return errors.New("--retries cannot be negative")
 	}
 	if config.Timeout <= 0 {
 		return errors.New("--timeout must be greater than zero")
@@ -56,8 +100,13 @@ func (config Config) Validate(now time.Time) error {
 	return err
 }
 
+// SelectedYears returns the years to fetch, newest first. It returns nil when every year is
+// selected, because that list comes from the API.
 func (config Config) SelectedYears(now time.Time) ([]int, error) {
 	currentYear := now.Year()
+	if config.AllYears {
+		return nil, nil
+	}
 	if config.Year != 0 {
 		return []int{config.Year}, nil
 	}
@@ -87,16 +136,51 @@ func (config Config) SelectedYears(now time.Time) ([]int, error) {
 	return years, nil
 }
 
+// PackTypes lists the listing types to query for the configured --type.
+func (config Config) PackTypes() []string {
+	switch config.Type {
+	case TypeMags:
+		return []string{TypeMags}
+	case TypeAll:
+		return []string{TypePacks, TypeMags}
+	default:
+		return []string{TypePacks}
+	}
+}
+
+// FileFilter returns the extraction filter implied by --extensions, or nil for everything.
+func (config Config) FileFilter() fileFilter {
+	return extensionFilter(config.Extensions)
+}
+
 type Summary struct {
 	Fetched         int
 	Skipped         int
+	Unavailable     int
+	Unsupported     int
 	Failed          int
 	DownloadedBytes int64
 }
 
 func (summary Summary) Print(writer io.Writer) {
-	fmt.Fprintf(writer, "Summary: fetched=%d skipped=%d failed=%d downloaded=%s\n",
-		summary.Fetched, summary.Skipped, summary.Failed, formatBytes(summary.DownloadedBytes))
+	fmt.Fprintf(writer, "Summary: fetched=%d skipped=%d unavailable=%d unsupported=%d failed=%d downloaded=%s\n",
+		summary.Fetched, summary.Skipped, summary.Unavailable, summary.Unsupported, summary.Failed, formatBytes(summary.DownloadedBytes))
+}
+
+func (summary *Summary) count(outcome packOutcome) {
+	summary.DownloadedBytes += outcome.bytes
+	switch outcome.status {
+	case statusFetched:
+		summary.Fetched++
+	case statusSkipped:
+		summary.Skipped++
+	case statusUnavailable:
+		summary.Unavailable++
+	case statusUnsupported:
+		summary.Unsupported++
+	case statusFailed:
+		summary.Failed++
+	}
 }
 
 func formatBytes(bytes int64) string {
@@ -117,18 +201,61 @@ type Fetcher struct {
 	config   Config
 	output   io.Writer
 	lookPath func(string) (string, error)
+	now      func() time.Time
 	logMutex sync.Mutex
 }
 
 func NewFetcher(client *Client, config Config, output io.Writer) *Fetcher {
-	return &Fetcher{client: client, config: config, output: output, lookPath: exec.LookPath}
+	fetcher := &Fetcher{client: client, config: config, output: output, lookPath: exec.LookPath, now: time.Now}
+	client.SetLogger(fetcher.logf)
+	return fetcher
 }
 
 type packJob struct {
-	year       int
 	result     Result
 	archiveURL *url.URL
-	extension  string
+	// alternateURLs are tried, in order, when the listed archive URL is not found.
+	alternateURLs []*url.URL
+	extension     string
+	extractor     *resolvedExtractor
+	// status is set when the job was classified before any download: unavailable,
+	// unsupported, or failed. Jobs with an empty status are ready to fetch.
+	status string
+	reason error
+}
+
+func (job packJob) label() string {
+	return fmt.Sprintf("%d/%s", job.result.Year, displayPackName(job.result.Name))
+}
+
+func (job packJob) candidateURLs() []*url.URL {
+	return append([]*url.URL{job.archiveURL}, job.alternateURLs...)
+}
+
+func (job packJob) candidateURLStrings() []string {
+	var urls []string
+	for _, candidate := range job.candidateURLs() {
+		urls = append(urls, candidate.String())
+	}
+	return urls
+}
+
+// alternateArchiveURLs guesses where an archive lives when the listed link is wrong. Archives
+// whose file names contain punctuation such as '#', '$', '~', or spaces are often stored under
+// the plain pack name instead.
+func alternateArchiveURLs(primary *url.URL, result Result) []*url.URL {
+	candidate := *primary
+	candidate.Path = path.Join(path.Dir(primary.Path), result.Name+path.Ext(primary.Path))
+	candidate.RawPath = ""
+	if candidate.Path == primary.Path {
+		return nil
+	}
+	return []*url.URL{&candidate}
+}
+
+func isNotFound(err error) bool {
+	var statusErr *httpError
+	return errors.As(err, &statusErr) && (statusErr.status == http.StatusNotFound || statusErr.status == http.StatusGone)
 }
 
 type packOutcome struct {
@@ -138,74 +265,54 @@ type packOutcome struct {
 }
 
 func (fetcher *Fetcher) Run(ctx context.Context) (Summary, error) {
-	years, err := fetcher.config.SelectedYears(time.Now())
+	years, err := fetcher.selectYears(ctx)
 	if err != nil {
 		return Summary{}, err
 	}
 
-	var jobs []packJob
-	var failures []string
-	matchedPack := false
-	for _, year := range years {
-		response, err := fetcher.client.FetchYear(ctx, year)
-		if err != nil {
-			failures = append(failures, fmt.Sprintf("year %d: %v", year, err))
+	jobs, failures := fetcher.collectJobs(ctx, years)
+	if ctx.Err() == nil && !fetcher.config.DryRun {
+		for _, yearPath := range fetcher.yearPaths(jobs) {
+			if err := cleanupStagingArtifacts(yearPath); err != nil {
+				failures = append(failures, fmt.Sprintf("clean %s: %v", yearPath, err))
+			}
+		}
+	}
+
+	var summary Summary
+	var ready []packJob
+	for _, job := range jobs {
+		if job.status == "" {
+			ready = append(ready, job)
 			continue
 		}
-		for _, result := range response.Results {
-			if fetcher.config.Pack != "" && !strings.EqualFold(fetcher.config.Pack, result.Name) {
-				continue
-			}
-			matchedPack = true
-			job, err := fetcher.makeJob(year, result)
-			if err != nil {
-				failures = append(failures, fmt.Sprintf("year %d pack %q: %v", year, displayPackName(result.Name), err))
-				continue
-			}
-			jobs = append(jobs, job)
-		}
-	}
-	if fetcher.config.Pack != "" && !matchedPack {
-		failures = append(failures, fmt.Sprintf("pack %q was not found in the selected years", fetcher.config.Pack))
-	}
-
-	lhaPath := ""
-	hasLHA := false
-	for _, job := range jobs {
-		if job.extension == ".lha" || job.extension == ".lzh" {
-			hasLHA = true
-			break
-		}
-	}
-	if hasLHA {
-		lhaPath, err = fetcher.lookPath("lha")
-		if err != nil {
-			remainingJobs := jobs[:0]
-			for _, job := range jobs {
-				if job.extension == ".lha" || job.extension == ".lzh" {
-					failures = append(failures, fmt.Sprintf("year %d pack %q: lha command is required", job.year, job.result.Name))
-					continue
-				}
-				remainingJobs = append(remainingJobs, job)
-			}
-			jobs = remainingJobs
-		}
-	}
-
-	summary := Summary{Failed: len(failures)}
-	outcomes := fetcher.processJobs(ctx, jobs, lhaPath)
-	for outcome := range outcomes {
-		summary.DownloadedBytes += outcome.bytes
-		switch outcome.status {
-		case "fetched":
-			summary.Fetched++
-		case "skipped":
-			summary.Skipped++
-		case "failed":
-			summary.Failed++
+		outcome := fetcher.reportClassified(job)
+		summary.count(outcome)
+		if outcome.err != nil {
 			failures = append(failures, outcome.err.Error())
 		}
 	}
+
+	if fetcher.config.DryRun {
+		if !fetcher.config.Quiet && len(ready) > 0 {
+			fetcher.logf("Dry run: nothing will be downloaded.\n")
+		}
+		for _, job := range ready {
+			outcome := fetcher.planJob(job)
+			summary.count(outcome)
+			if outcome.err != nil {
+				failures = append(failures, outcome.err.Error())
+			}
+		}
+	} else {
+		for outcome := range fetcher.processJobs(ctx, ready) {
+			summary.count(outcome)
+			if outcome.err != nil {
+				failures = append(failures, outcome.err.Error())
+			}
+		}
+	}
+
 	if ctx.Err() != nil {
 		summary.Failed++
 		failures = append(failures, fmt.Sprintf("fetch canceled: %v", ctx.Err()))
@@ -213,28 +320,134 @@ func (fetcher *Fetcher) Run(ctx context.Context) (Summary, error) {
 	if len(failures) == 0 {
 		return summary, nil
 	}
-	sort.Strings(failures)
+	slices.Sort(failures)
 	return summary, errors.New(strings.Join(failures, "\n"))
 }
 
-func (fetcher *Fetcher) makeJob(year int, result Result) (packJob, error) {
+func (fetcher *Fetcher) selectYears(ctx context.Context) ([]int, error) {
+	years, err := fetcher.config.SelectedYears(fetcher.now())
+	if err != nil {
+		return nil, err
+	}
+	if years != nil {
+		return years, nil
+	}
+	return fetcher.client.ListYears(ctx)
+}
+
+// collectJobs lists the selected years and turns every matching pack into a job.
+func (fetcher *Fetcher) collectJobs(ctx context.Context, years []int) ([]packJob, []string) {
+	var jobs []packJob
+	var failures []string
+	matchedPatterns := make(map[string]bool)
+	extractors := make(map[string]*resolvedExtractor)
+	extractorErrors := make(map[string]error)
+
+listing:
+	for _, year := range years {
+		for _, packType := range fetcher.config.PackTypes() {
+			if ctx.Err() != nil {
+				break listing
+			}
+			response, err := fetcher.client.FetchYear(ctx, year, packType)
+			if err != nil {
+				if ctx.Err() != nil {
+					break listing
+				}
+				failures = append(failures, fmt.Sprintf("year %d: %v", year, err))
+				continue
+			}
+			for _, result := range response.Results {
+				if result.Year == 0 {
+					result.Year = year
+				}
+				if !fetcher.selects(result, matchedPatterns) {
+					continue
+				}
+				job := fetcher.classify(result)
+				if job.status == "" && job.extension != ".zip" {
+					if _, seen := extractors[job.extension]; !seen {
+						extractors[job.extension], extractorErrors[job.extension] = findExtractor(fetcher.lookPath, job.extension)
+					}
+					if extractorErrors[job.extension] != nil {
+						job.status, job.reason = statusUnsupported, extractorErrors[job.extension]
+					} else {
+						job.extractor = extractors[job.extension]
+					}
+				}
+				jobs = append(jobs, job)
+			}
+		}
+	}
+	for _, pattern := range fetcher.config.Packs {
+		if !matchedPatterns[strings.ToLower(pattern)] {
+			failures = append(failures, fmt.Sprintf("pack %q was not found in the selected years", pattern))
+		}
+	}
+	return jobs, failures
+}
+
+// selects applies the --pack and --group filters.
+func (fetcher *Fetcher) selects(result Result, matchedPatterns map[string]bool) bool {
+	if len(fetcher.config.Groups) > 0 {
+		inGroup := slices.ContainsFunc(result.Groups, func(group string) bool {
+			return slices.ContainsFunc(fetcher.config.Groups, func(wanted string) bool { return strings.EqualFold(group, wanted) })
+		})
+		if !inGroup {
+			return false
+		}
+	}
+	if len(fetcher.config.Packs) == 0 {
+		return true
+	}
+	selected := false
+	for _, pattern := range fetcher.config.Packs {
+		if matchesPackPattern(pattern, result.Name) {
+			matchedPatterns[strings.ToLower(pattern)] = true
+			selected = true
+		}
+	}
+	return selected
+}
+
+// matchesPackPattern compares a pack name to a --pack value without regard to case. Values
+// containing *, ?, or [ are shell-style patterns; anything else must match exactly.
+func matchesPackPattern(pattern string, name string) bool {
+	pattern = strings.ToLower(pattern)
+	name = strings.ToLower(name)
+	if !strings.ContainsAny(pattern, `*?[`) {
+		return pattern == name
+	}
+	matched, err := path.Match(pattern, name)
+	return err == nil && matched
+}
+
+// classify validates a listing entry and marks it unavailable, unsupported, or failed when it
+// cannot be fetched. Fetchable entries get their archive URL and extension.
+func (fetcher *Fetcher) classify(result Result) packJob {
+	job := packJob{result: result}
 	if err := validatePackName(result.Name); err != nil {
-		return packJob{}, err
+		job.status, job.reason = statusFailed, err
+		return job
 	}
 	archiveURL, err := fetcher.client.ValidateArchiveURL(result.Download)
-	if err != nil {
-		return packJob{}, err
+	switch {
+	case errors.Is(err, errNoArchive):
+		job.status, job.reason = statusUnavailable, err
+	case errors.Is(err, errUnsupportedArchive):
+		job.status, job.reason = statusUnsupported, err
+	case err != nil:
+		job.status, job.reason = statusFailed, err
+	default:
+		job.archiveURL = archiveURL
+		job.alternateURLs = alternateArchiveURLs(archiveURL, result)
+		job.extension = strings.ToLower(filepath.Ext(archiveURL.Path))
 	}
-	return packJob{
-		year:       year,
-		result:     result,
-		archiveURL: archiveURL,
-		extension:  strings.ToLower(filepath.Ext(archiveURL.Path)),
-	}, nil
+	return job
 }
 
 func validatePackName(name string) error {
-	if name == "" || name == "." || name == ".." || filepath.IsAbs(name) || filepath.Base(name) != name || strings.ContainsAny(name, `/\\`) {
+	if name == "" || name == "." || name == ".." || filepath.IsAbs(name) || filepath.Base(name) != name || strings.ContainsAny(name, `/\`) {
 		return fmt.Errorf("unsafe pack name %q", name)
 	}
 	return nil
@@ -247,23 +460,66 @@ func displayPackName(name string) string {
 	return name
 }
 
-func (fetcher *Fetcher) processJobs(ctx context.Context, jobs []packJob, lhaPath string) <-chan packOutcome {
+func (fetcher *Fetcher) yearPaths(jobs []packJob) []string {
+	var paths []string
+	for _, job := range jobs {
+		if job.status != "" {
+			continue
+		}
+		yearPath := fetcher.yearPath(job.result.Year)
+		if !slices.Contains(paths, yearPath) {
+			paths = append(paths, yearPath)
+		}
+	}
+	return paths
+}
+
+func (fetcher *Fetcher) yearPath(year int) string {
+	return filepath.Join(fetcher.config.Path, fmt.Sprintf("%d", year))
+}
+
+// reportClassified logs and converts a job that was classified before downloading.
+func (fetcher *Fetcher) reportClassified(job packJob) packOutcome {
+	switch job.status {
+	case statusUnavailable:
+		fetcher.logf("Unavailable %s (%v)\n", job.label(), job.reason)
+		return packOutcome{status: statusUnavailable}
+	case statusUnsupported:
+		fetcher.logf("Unsupported %s (%v)\n", job.label(), job.reason)
+		return packOutcome{status: statusUnsupported}
+	default:
+		return failedOutcome(job, 0, job.reason)
+	}
+}
+
+// planJob reports what a real run would do with a ready job.
+func (fetcher *Fetcher) planJob(job packJob) packOutcome {
+	outputDir := filepath.Join(fetcher.yearPath(job.result.Year), job.result.Name)
+	skipped, err := fetcher.shouldSkip(outputDir, job.candidateURLStrings())
+	if err != nil {
+		fetcher.logf("Would fail %s (%v)\n", job.label(), err)
+		return failedOutcome(job, 0, err)
+	}
+	if skipped {
+		fetcher.logf("Would skip %s (already complete)\n", job.label())
+		return packOutcome{status: statusSkipped}
+	}
+	fetcher.logf("Would fetch %s (%s)\n", job.label(), path.Base(job.archiveURL.Path))
+	return packOutcome{status: statusFetched}
+}
+
+func (fetcher *Fetcher) processJobs(ctx context.Context, jobs []packJob) <-chan packOutcome {
 	jobChannel := make(chan packJob)
 	outcomeChannel := make(chan packOutcome)
-	workers := fetcher.config.Concurrency
-	if workers > len(jobs) {
-		workers = len(jobs)
-	}
+	workers := min(fetcher.config.Concurrency, len(jobs))
 
 	var waitGroup sync.WaitGroup
-	for worker := 0; worker < workers; worker++ {
-		waitGroup.Add(1)
-		go func() {
-			defer waitGroup.Done()
+	for range workers {
+		waitGroup.Go(func() {
 			for job := range jobChannel {
-				outcomeChannel <- fetcher.processJob(ctx, job, lhaPath)
+				outcomeChannel <- fetcher.processJob(ctx, job)
 			}
-		}()
+		})
 	}
 	go func() {
 		defer close(jobChannel)
@@ -282,8 +538,8 @@ func (fetcher *Fetcher) processJobs(ctx context.Context, jobs []packJob, lhaPath
 	return outcomeChannel
 }
 
-func (fetcher *Fetcher) processJob(ctx context.Context, job packJob, lhaPath string) packOutcome {
-	yearPath := filepath.Join(fetcher.config.Path, fmt.Sprintf("%d", job.year))
+func (fetcher *Fetcher) processJob(ctx context.Context, job packJob) packOutcome {
+	yearPath := fetcher.yearPath(job.result.Year)
 	outputDir := filepath.Join(yearPath, job.result.Name)
 	if err := ensureContainedPath(yearPath, outputDir); err != nil {
 		return failedOutcome(job, 0, err)
@@ -292,41 +548,57 @@ func (fetcher *Fetcher) processJob(ctx context.Context, job packJob, lhaPath str
 		return failedOutcome(job, 0, fmt.Errorf("create year directory: %w", err))
 	}
 
-	skipped, err := fetcher.shouldSkip(outputDir, job.archiveURL.String())
+	skipped, err := fetcher.shouldSkip(outputDir, job.candidateURLStrings())
 	if err != nil {
 		return failedOutcome(job, 0, err)
 	}
 	if skipped {
-		fetcher.logf("Skipped %d/%s (already complete)\n", job.year, job.result.Name)
-		return packOutcome{status: "skipped"}
+		fetcher.logf("Skipped %s (already complete)\n", job.label())
+		return packOutcome{status: statusSkipped}
 	}
 
-	archivePath := filepath.Join(yearPath, job.result.Name+"-"+filepath.Base(job.archiveURL.Path))
-	fetcher.logf("Downloading %d/%s\n", job.year, job.result.Name)
-	downloadedBytes, err := fetcher.client.Download(ctx, job.archiveURL, archivePath, job.result.Name)
+	archivePath := filepath.Join(yearPath, job.result.Name+"-"+path.Base(job.archiveURL.Path))
+	fetcher.logf("Downloading %s\n", job.label())
+	archiveURL, downloadedBytes, err := fetcher.download(ctx, job, archivePath)
+	if isNotFound(err) {
+		fetcher.logf("Unavailable %s (archive not found on server)\n", job.label())
+		return packOutcome{status: statusUnavailable}
+	}
 	if err != nil {
 		return failedOutcome(job, downloadedBytes, err)
 	}
 
-	stagingDir, err := os.MkdirTemp(yearPath, ".fetch16c-*")
+	stagingDir, err := os.MkdirTemp(yearPath, stagingPrefix+"*")
 	if err != nil {
 		fetcher.removeArchive(archivePath)
 		return failedOutcome(job, downloadedBytes, fmt.Errorf("create extraction directory: %w", err))
 	}
-	defer os.RemoveAll(stagingDir)
+	defer func() { _ = os.RemoveAll(stagingDir) }()
 
-	if err := extractArchive(ctx, archivePath, stagingDir, lhaPath); err != nil {
+	extracted, err := extractArchive(ctx, archivePath, stagingDir, job.extractor, fetcher.config.FileFilter())
+	if err != nil {
+		fetcher.removeArchive(archivePath)
+		return failedOutcome(job, downloadedBytes, err)
+	}
+	fileCount, err := countFiles(stagingDir)
+	if err != nil {
 		fetcher.removeArchive(archivePath)
 		return failedOutcome(job, downloadedBytes, err)
 	}
 	manifest := Manifest{
-		Version:     1,
+		Version:     manifestVersion,
 		Complete:    true,
-		Year:        job.year,
+		Year:        job.result.Year,
 		Name:        job.result.Name,
-		ArchiveURL:  job.archiveURL.String(),
+		Gallery:     job.result.Gallery,
+		Groups:      job.result.Groups,
+		ArchiveURL:  archiveURL.String(),
+		ArchiveName: path.Base(job.archiveURL.Path),
 		ArchiveSize: downloadedBytes,
-		CompletedAt: time.Now().UTC(),
+		FileCount:   fileCount,
+		Damaged:     extracted.Damaged,
+		Extensions:  normalizeExtensions(fetcher.config.Extensions),
+		CompletedAt: fetcher.now().UTC(),
 	}
 	if err := writeManifest(stagingDir, manifest); err != nil {
 		fetcher.removeArchive(archivePath)
@@ -341,11 +613,36 @@ func (fetcher *Fetcher) processJob(ctx context.Context, job packJob, lhaPath str
 		}
 	}
 
-	fetcher.logf("Extracted %d/%s\n", job.year, job.result.Name)
-	return packOutcome{status: "fetched", bytes: downloadedBytes}
+	if len(extracted.Damaged) > 0 {
+		fetcher.logf("Extracted %s (%d files; skipped %d damaged: %s)\n", job.label(), fileCount, len(extracted.Damaged), strings.Join(extracted.Damaged, ", "))
+	} else {
+		fetcher.logf("Extracted %s (%d files)\n", job.label(), fileCount)
+	}
+	return packOutcome{status: statusFetched, bytes: downloadedBytes}
 }
 
-func (fetcher *Fetcher) shouldSkip(outputDir string, archiveURL string) (bool, error) {
+// download fetches the first candidate archive URL that exists and reports which one it used.
+// A not-found error is returned only when every candidate is missing.
+func (fetcher *Fetcher) download(ctx context.Context, job packJob, archivePath string) (*url.URL, int64, error) {
+	candidates := job.candidateURLs()
+	for index, candidate := range candidates {
+		if index > 0 {
+			fetcher.logf("Trying alternate archive %s for %s\n", path.Base(candidate.Path), job.label())
+		}
+		downloadedBytes, err := fetcher.client.Download(ctx, candidate, archivePath, job.result.Name)
+		if err == nil {
+			return candidate, downloadedBytes, nil
+		}
+		if !isNotFound(err) || index == len(candidates)-1 {
+			return candidate, downloadedBytes, err
+		}
+	}
+	return nil, 0, errors.New("no archive URL candidates")
+}
+
+// shouldSkip reports whether outputDir already holds a complete copy of one of the candidate
+// archive URLs, extracted with the configured file filter.
+func (fetcher *Fetcher) shouldSkip(outputDir string, archiveURLs []string) (bool, error) {
 	info, err := os.Lstat(outputDir)
 	if os.IsNotExist(err) {
 		return false, nil
@@ -357,24 +654,27 @@ func (fetcher *Fetcher) shouldSkip(outputDir string, archiveURL string) (bool, e
 		return false, nil
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
-		return false, fmt.Errorf("output path is a symbolic link; use --overwrite to replace it")
+		return false, errors.New("output path is a symbolic link; use --overwrite to replace it")
 	}
 	if !info.IsDir() {
-		return false, fmt.Errorf("output path exists and is not a directory; use --overwrite to replace it")
+		return false, errors.New("output path exists and is not a directory; use --overwrite to replace it")
 	}
 	if !fetcher.config.SkipExisting {
-		return false, fmt.Errorf("output directory exists; use --overwrite to replace it")
+		return false, errors.New("output directory exists; use --overwrite to replace it")
 	}
 
 	manifest, err := readManifest(outputDir)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return false, fmt.Errorf("output directory has no completion manifest; use --overwrite once to adopt it")
+			return false, errors.New("output directory has no completion manifest; use --overwrite once to adopt it")
 		}
 		return false, fmt.Errorf("read completion manifest: %w", err)
 	}
-	if !manifest.Complete || manifest.ArchiveURL != archiveURL {
-		return false, fmt.Errorf("output directory has a stale completion manifest; use --overwrite to replace it")
+	if !manifest.Complete || !slices.Contains(archiveURLs, manifest.ArchiveURL) {
+		return false, errors.New("output directory has a stale completion manifest; use --overwrite to replace it")
+	}
+	if !slices.Equal(manifest.Extensions, normalizeExtensions(fetcher.config.Extensions)) {
+		return false, errors.New("output directory was extracted with a different file filter; use --overwrite to replace it")
 	}
 	return true, nil
 }
@@ -385,7 +685,7 @@ func (fetcher *Fetcher) removeArchive(archivePath string) {
 	}
 }
 
-func (fetcher *Fetcher) logf(format string, values ...interface{}) {
+func (fetcher *Fetcher) logf(format string, values ...any) {
 	if fetcher.config.Quiet {
 		return
 	}
@@ -396,9 +696,9 @@ func (fetcher *Fetcher) logf(format string, values ...interface{}) {
 
 func failedOutcome(job packJob, downloadedBytes int64, err error) packOutcome {
 	return packOutcome{
-		status: "failed",
+		status: statusFailed,
 		bytes:  downloadedBytes,
-		err:    fmt.Errorf("year %d pack %q: %w", job.year, displayPackName(job.result.Name), err),
+		err:    fmt.Errorf("year %d pack %q: %w", job.result.Year, displayPackName(job.result.Name), err),
 	}
 }
 
@@ -410,13 +710,63 @@ func ensureContainedPath(root string, candidate string) error {
 	return nil
 }
 
+func countFiles(root string) (int, error) {
+	count := 0
+	err := filepath.WalkDir(root, func(_ string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.Type().IsRegular() {
+			count++
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("count extracted files: %w", err)
+	}
+	return count, nil
+}
+
+// cleanupStagingArtifacts removes staging directories and partial downloads that an earlier,
+// interrupted run left in a year directory. Replacement backups are kept.
+func cleanupStagingArtifacts(yearPath string) error {
+	entries, err := os.ReadDir(yearPath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		switch {
+		case entry.IsDir() && strings.HasPrefix(name, stagingPrefix):
+			if err := os.RemoveAll(filepath.Join(yearPath, name)); err != nil {
+				return err
+			}
+		case !entry.IsDir() && strings.HasPrefix(name, ".") && strings.HasSuffix(name, ".part"):
+			if err := os.Remove(filepath.Join(yearPath, name)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// Manifest records a completed extraction so later runs can skip or detect stale packs.
 type Manifest struct {
 	Version     int       `json:"version"`
 	Complete    bool      `json:"complete"`
 	Year        int       `json:"year"`
 	Name        string    `json:"name"`
+	Gallery     string    `json:"gallery,omitempty"`
+	Groups      []string  `json:"groups,omitempty"`
 	ArchiveURL  string    `json:"archive_url"`
+	ArchiveName string    `json:"archive_name,omitempty"`
 	ArchiveSize int64     `json:"archive_size"`
+	FileCount   int       `json:"file_count,omitempty"`
+	Damaged     []string  `json:"damaged_files,omitempty"`
+	Extensions  []string  `json:"extensions,omitempty"`
 	CompletedAt time.Time `json:"completed_at"`
 }
 
@@ -459,7 +809,7 @@ func commitDirectory(stagingDir string, outputDir string, overwrite bool) error 
 		return errors.New("output directory already exists")
 	}
 
-	backupDir, err := os.MkdirTemp(filepath.Dir(outputDir), ".fetch16c-backup-*")
+	backupDir, err := os.MkdirTemp(filepath.Dir(outputDir), backupPrefix+"*")
 	if err != nil {
 		return fmt.Errorf("create replacement backup: %w", err)
 	}

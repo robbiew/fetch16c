@@ -25,4 +25,4 @@ jobs:
       - name: Download and extract a current pack
         env:
           FETCH16C_LIVE_TEST: "1"
-        run: go test -run '^TestLive' -count=1 -v
+        run: go test -run '^TestLive' -count=1 -v .

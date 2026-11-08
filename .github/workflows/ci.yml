@@ -9,13 +9,18 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }}, Go ${{ matrix.go-version }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        go-version:
-          - 1.25.x
-          - stable
+        os: [ubuntu-latest]
+        go-version: ["1.26.x", stable]
+        include:
+          - os: macos-latest
+            go-version: stable
+          - os: windows-latest
+            go-version: stable
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
@@ -23,10 +28,39 @@ jobs:
           go-version: ${{ matrix.go-version }}
           cache: true
       - name: Check formatting
+        if: runner.os != 'Windows'
         run: test -z "$(gofmt -l .)"
+      - name: Check module tidiness
+        if: runner.os != 'Windows'
+        run: go mod tidy -diff
       - name: Test
         run: go test -race ./...
       - name: Vet
         run: go vet ./...
       - name: Build
         run: go build ./...
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: true
+      - uses: golangci/golangci-lint-action@v8
+        with:
+          version: latest
+
+  vulncheck:
+    name: Vulnerability check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: true
+      - name: Run govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
