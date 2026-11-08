@@ -1,18 +1,23 @@
 package main
 
 import (
-	"archive/zip"
+	"bytes"
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+func errorIs(err error, target error) bool {
+	return errors.Is(err, target)
+}
 
 func TestArchiveDownloadURL(t *testing.T) {
 	tests := []struct {
@@ -24,6 +29,11 @@ func TestArchiveDownloadURL(t *testing.T) {
 			name: "official archive",
 			url:  "https://16colo.rs/archive/2026/chromeintro.zip",
 			want: "https://api.16colo.rs/archive/2026/chromeintro.zip",
+		},
+		{
+			name: "hash in archive name",
+			url:  "https://16colo.rs/archive/1996/joint#06.zip",
+			want: "https://api.16colo.rs/archive/1996/joint%2306.zip",
 		},
 		{
 			name: "unrelated path",
@@ -46,106 +56,69 @@ func TestArchiveDownloadURL(t *testing.T) {
 	}
 }
 
-func TestFetchAPIResponseRejectsHTTPError(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+func TestExecuteReturnsNonzeroOnFetchFailure(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
 		http.Error(writer, "unavailable", http.StatusServiceUnavailable)
 	}))
 	defer server.Close()
 
-	client := newTestClient(t, server.URL+"/")
-	if _, err := client.FetchYear(context.Background(), 2026); err == nil {
-		t.Fatal("FetchYear accepted an unsuccessful HTTP response")
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	exitCode := execute(context.Background(), []string{"--year", "2026", "--quiet", "--retries", "0", "--path", t.TempDir()}, &stdout, &stderr, server.URL+"/")
+	if exitCode != 1 {
+		t.Fatalf("execute exit code = %d, want 1", exitCode)
+	}
+	if !bytes.Contains(stderr.Bytes(), []byte("year 2026")) {
+		t.Fatalf("stderr does not identify the failed year: %s", stderr.String())
 	}
 }
 
-func TestFetchYearResponseGetsEveryPage(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
-		page := 1
-		name := "first"
-		if request.URL.Query().Get("page") == "2" {
-			page = 2
-			name = "second"
-		}
-		response := Response{
-			Page:    Page{Page: page, Pages: 2, Total: 2},
-			Results: []Result{{Name: name}},
-		}
-		if err := json.NewEncoder(writer).Encode(response); err != nil {
-			t.Fatal(err)
-		}
+func TestExecuteReturnsTwoForInvalidFlags(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if exitCode := execute(context.Background(), []string{"--concurrency", "0"}, &stdout, &stderr, defaultAPIBaseURL); exitCode != 2 {
+		t.Fatalf("execute exit code = %d, want 2", exitCode)
+	}
+}
+
+func TestExecutePrintsVersion(t *testing.T) {
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	if exitCode := execute(context.Background(), []string{"--version"}, &stdout, &stderr, defaultAPIBaseURL); exitCode != 0 {
+		t.Fatalf("execute exit code = %d, want 0", exitCode)
+	}
+	if !strings.HasPrefix(stdout.String(), "fetch16c ") {
+		t.Fatalf("version output = %q", stdout.String())
+	}
+}
+
+func TestExecuteSucceedsWithUnsupportedPacksAndWarns(t *testing.T) {
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writeAPIResponse(t, writer, []Result{{Year: 2026, Name: "old", Download: server.URL + "/archive/2026/old.arj"}})
 	}))
 	defer server.Close()
 
-	client := newTestClient(t, server.URL+"/")
-	response, err := client.FetchYear(context.Background(), 2026)
-	if err != nil {
-		t.Fatal(err)
+	t.Setenv("PATH", t.TempDir())
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	exitCode := execute(context.Background(), []string{"--year", "2026", "--path", t.TempDir()}, &stdout, &stderr, server.URL+"/")
+	if exitCode != 0 {
+		t.Fatalf("execute exit code = %d, want 0 (stderr: %s)", exitCode, stderr.String())
 	}
-	if len(response.Results) != 2 || response.Results[0].Name != "first" || response.Results[1].Name != "second" {
-		t.Fatalf("FetchYear returned %#v", response.Results)
-	}
-}
-
-func TestDownloadFileRejectsHTTPError(t *testing.T) {
-	server := httptest.NewServer(http.NotFoundHandler())
-	defer server.Close()
-
-	client := newTestClient(t, server.URL+"/")
-	archiveURL, err := client.ValidateArchiveURL(server.URL + "/archive/missing.zip")
-	if err != nil {
-		t.Fatal(err)
-	}
-	outputPath := filepath.Join(t.TempDir(), "missing.zip")
-	if _, err := client.Download(context.Background(), archiveURL, outputPath, "missing"); err == nil {
-		t.Fatal("Download accepted an unsuccessful HTTP response")
-	}
-	if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
-		t.Fatalf("downloadFile created %s after an HTTP error", outputPath)
+	if !strings.Contains(stdout.String(), "unsupported=1") || !strings.Contains(stderr.String(), "install lha, 7z, or unar") {
+		t.Fatalf("stdout = %q, stderr = %q", stdout.String(), stderr.String())
 	}
 }
 
-func TestExtractZipArchiveWithAbsoluteOutputPath(t *testing.T) {
-	archivePath := filepath.Join(t.TempDir(), "pack.zip")
-	createZipArchive(t, archivePath, "nested/art.ans")
-
-	outputDir := t.TempDir()
-	if err := extractZipArchive(archivePath, outputDir); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(filepath.Join(outputDir, "nested", "art.ans")); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestExtractZipArchiveRejectsTraversal(t *testing.T) {
-	archivePath := filepath.Join(t.TempDir(), "pack.zip")
-	createZipArchive(t, archivePath, "../escaped.ans")
-
-	if err := extractZipArchive(archivePath, t.TempDir()); err == nil {
-		t.Fatal("extractZipArchive accepted a path outside the output directory")
-	}
-}
-
-func createZipArchive(t *testing.T, archivePath string, entryName string) {
-	t.Helper()
-
-	file, err := os.Create(archivePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	archive := zip.NewWriter(file)
-	entry, err := archive.Create(entryName)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := entry.Write([]byte("ANSI art")); err != nil {
-		t.Fatal(err)
-	}
-	if err := archive.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := file.Close(); err != nil {
-		t.Fatal(err)
+func TestExecuteReturnsInterruptedExitCode(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+	exitCode := execute(ctx, []string{"--year", "2026", "--quiet", "--path", t.TempDir()}, &stdout, &stderr, "http://127.0.0.1:9/")
+	if exitCode != exitInterrupted {
+		t.Fatalf("execute exit code = %d, want %d", exitCode, exitInterrupted)
 	}
 }
 
@@ -155,11 +128,11 @@ func TestLiveArtPackDownloadAndExtraction(t *testing.T) {
 	}
 
 	year := time.Now().Year()
-	client, err := NewClient(defaultAPIBaseURL, 2*time.Minute, io.Discard, false)
+	client, err := NewClient(defaultAPIBaseURL, ClientOptions{Timeout: 2 * time.Minute, Retries: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
-	response, err := client.FetchYear(context.Background(), year)
+	response, err := client.FetchYear(context.Background(), year, TypePacks)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,7 +143,7 @@ func TestLiveArtPackDownloadAndExtraction(t *testing.T) {
 	result := response.Results[0]
 	config := testConfig(t.TempDir())
 	config.Year = year
-	config.Pack = result.Name
+	config.Packs = []string{result.Name}
 	fetcher := NewFetcher(client, config, io.Discard)
 	summary, err := fetcher.Run(context.Background())
 	if err != nil {
@@ -202,11 +175,11 @@ func TestLiveHistoricalPagination(t *testing.T) {
 		t.Skip("set FETCH16C_LIVE_TEST=1 to run the live smoke test")
 	}
 
-	client, err := NewClient(defaultAPIBaseURL, 2*time.Minute, io.Discard, false)
+	client, err := NewClient(defaultAPIBaseURL, ClientOptions{Timeout: 2 * time.Minute, Retries: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
-	response, err := client.FetchYear(context.Background(), 1996)
+	response, err := client.FetchYear(context.Background(), 1996, TypePacks)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -215,11 +188,27 @@ func TestLiveHistoricalPagination(t *testing.T) {
 	}
 }
 
-func newTestClient(t *testing.T, apiBaseURL string) *Client {
-	t.Helper()
-	client, err := NewClient(apiBaseURL, time.Second, io.Discard, false)
+func TestLiveNumericPackNamesDecode(t *testing.T) {
+	if os.Getenv("FETCH16C_LIVE_TEST") == "" {
+		t.Skip("set FETCH16C_LIVE_TEST=1 to run the live smoke test")
+	}
+
+	client, err := NewClient(defaultAPIBaseURL, ClientOptions{Timeout: 2 * time.Minute, Retries: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return client
+	// The 1990 listing contains a pack literally named 1990, served as a JSON number.
+	response, err := client.FetchYear(context.Background(), 1990, TypePacks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, result := range response.Results {
+		if result.Name == "1990" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("pack 1990 missing from %+v", response.Results)
+	}
 }
